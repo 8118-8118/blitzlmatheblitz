@@ -1,4 +1,12 @@
 import sys, csv, random, os, json, subprocess, tempfile, threading, datetime
+try:
+    from pptx import Presentation
+    from pptx.util import Pt
+    from pptx.enum.text import PP_ALIGN
+    from pptx.dml.color import RGBColor
+except ImportError:
+    Presentation = None
+
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QFileDialog, QSpinBox, QDoubleSpinBox,
@@ -15,13 +23,21 @@ VOWELS        = "aeiouäöüAEIOUÄÖÜ"
 DIPHTHONGS    = {"ai", "au", "ei", "eu", "ie", "äu", "oi"}
 DIGRAPHS_NEXT = ["sch", "ch", "ph", "th", "qu", "ck", "tz"]
 SPLIT_PAIRS   = ["ng", "nk"]
+GERMAN_PREFIXES = ["be", "ge", "ver", "vor", "ent", "zer", "er", "miss", "ur"]
 
 def split_syllables(word: str) -> list:
     if not word:
         return []
     if len(word) <= 2:
         return [word]
+
     wl = word.lower()
+    for pref in GERMAN_PREFIXES:
+        if wl.startswith(pref) and len(word) >= len(pref) + 2:
+            # Special case: don't split if it's just a word starting with these letters but not a prefix
+            # This is a heuristic.
+            return [word[:len(pref)]] + split_syllables(word[len(pref):])
+
     masked = ""
     i = 0
     while i < len(wl):
@@ -69,6 +85,62 @@ def split_syllables(word: str) -> list:
     result.append(word[prev:])
     return [s for s in result if s]
 
+def get_app_stylesheet(dark=False):
+    if dark:
+        bg = "#2C2C2C"
+        fg = "#E0E0E0"
+        card = "#3D3D3D"
+        accent = "#64B5F6"
+        tab_bg = "#333333"
+        tab_sel = "#444444"
+    else:
+        bg = "#F5F5F5"
+        fg = "#333333"
+        card = "#FFFFFF"
+        accent = "#1565C0"
+        tab_bg = "#EEEEEE"
+        tab_sel = "#F5F5F5"
+
+    return f"""
+        QMainWindow, QDialog {{ background-color: {bg}; color: {fg}; }}
+        QWidget {{ color: {fg}; }}
+        QTabWidget::pane {{ border: 1px solid #ddd; background: {bg}; }}
+        QTabBar::tab {{
+            padding: 10px 20px;
+            background: {tab_bg};
+            border: 1px solid #ccc;
+            border-bottom: none;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+        }}
+        QTabBar::tab:selected {{ background: {tab_sel}; color: {accent}; font-weight: bold; }}
+        QGroupBox {{
+            font-weight: bold;
+            border: 1px solid #ccc;
+            border-radius: 8px;
+            margin-top: 1.5ex;
+            padding: 10px;
+            background-color: {card};
+        }}
+        QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 3px; }}
+        QPushButton {{
+            background-color: {accent};
+            color: white;
+            border-radius: 6px;
+            padding: 6px 12px;
+            font-weight: bold;
+        }}
+        QPushButton:hover {{ background-color: {accent}CC; }}
+        QPushButton:disabled {{ background-color: #ccc; color: #888; }}
+        QLineEdit {{
+            border: 1px solid #ccc;
+            border-radius: 4px;
+            padding: 4px;
+            background: {card};
+        }}
+        QScrollArea {{ border: none; background: transparent; }}
+    """
+
 # ── Farben, Emojis, Hintergründe ────────────────────────────────────────────
 SYLLABLE_COLORS = [
     "#2563EB", "#DC2626", "#16A34A", "#9333EA", "#D97706", "#0891B2"
@@ -81,7 +153,97 @@ BG_PRESETS = {
     "Hellgrün":      "#E8F5E9",
     "Hellrosa":      "#FCE4EC",
     "Dunkelblau":    "#1a1a2e",
+    "Hellgrau":      "#F5F5F5",
+    "Dunkelgrau":    "#333333",
+    "Sand":          "#F5F5DC",
 }
+
+def _hex_to_rgb(hex_str):
+    hex_str = hex_str.lstrip('#')
+    return tuple(int(hex_str[i:i+2], 16) for i in (0, 2, 4))
+
+def save_to_pptx(slides_data, output_path, font_size, bg_color, syllable_colors, overrides):
+    if Presentation is None:
+        raise ImportError("python-pptx ist nicht installiert.")
+
+    prs = Presentation()
+    # Widescreen 16:9
+    prs.slide_width = 12192000
+    prs.slide_height = 6858000
+
+    for slide_info in slides_data:
+        slide_layout = prs.slide_layouts[6] # Blank
+        slide = prs.slides.add_slide(slide_layout)
+
+        # Background
+        background = slide.background
+        fill = background.fill
+        fill.solid()
+        r, g, b = _hex_to_rgb(bg_color)
+        fill.fore_color.rgb = RGBColor(r, g, b)
+
+        # Content
+        left = top = 0
+        width = prs.slide_width
+        height = prs.slide_height
+        txBox = slide.shapes.add_textbox(left, top, width, height)
+        tf = txBox.text_frame
+        tf.word_wrap = True
+        p = tf.paragraphs[0]
+        p.alignment = PP_ALIGN.CENTER
+
+        stype = slide_info["type"]
+        content = slide_info["content"] if "content" in slide_info else ""
+
+        if stype == "dance":
+            emojis = " ".join(random.choices(DANCE_EMOJIS, k=5))
+            p.text = f"{emojis}\nJetzt tanzen! 🎉\nBeweg dich zur Musik!"
+            p.font.size = Pt(font_size)
+            p.font.bold = True
+            p.font.color.rgb = RGBColor(233, 30, 99) # #E91E63
+            # Override background for dance
+            fill.fore_color.rgb = RGBColor(255, 249, 196) # #FFF9C4
+        elif stype in ("word", "sentence", "math_q", "math_a"):
+            if stype in ("word", "sentence"):
+                words_list = content.split()
+                for i, word in enumerate(words_list):
+                    if i > 0:
+                        run = p.add_run()
+                        run.text = "  "
+
+                    if content in overrides:
+                        # Simple implementation for overrides in pptx: just use the corrected text
+                        # but ideally we want syllable colors too.
+                        # overrides[content] looks like "Früh-stück"
+                        syls = []
+                        for chunk in overrides[content].split():
+                            syls.extend(chunk.split("-"))
+                        for j, syl in enumerate(syls):
+                            run = p.add_run()
+                            run.text = syl
+                            col = syllable_colors[j % len(syllable_colors)]
+                            r, g, b = _hex_to_rgb(col)
+                            run.font.color.rgb = RGBColor(r, g, b)
+                    else:
+                        syllables = split_syllables(word)
+                        for j, syl in enumerate(syllables):
+                            run = p.add_run()
+                            run.text = syl
+                            col = syllable_colors[j % len(syllable_colors)]
+                            r, g, b = _hex_to_rgb(col)
+                            run.font.color.rgb = RGBColor(r, g, b)
+            else: # math
+                p.text = content
+                if stype == "math_q":
+                    p.font.color.rgb = RGBColor(26, 35, 126) # #1A237E
+                else:
+                    p.font.color.rgb = RGBColor(230, 81, 0) # #E65100
+
+            p.font.size = Pt(font_size)
+            p.font.bold = True
+            p.font.name = "Georgia"
+
+    prs.save(output_path)
 
 # ── Dia-Generierung ─────────────────────────────────────────────────────────
 def build_slides(words: list, sentences: list,
@@ -256,19 +418,23 @@ class SlideWindow(QWidget):
 # ── Mathe-Diashow und Sound-Helfer ──────────────────────────────────────────
 def _play_sound(kind: str):
     def _do():
-        try:
-            import winsound
-            if kind == "question":
-                winsound.Beep(880, 80)
-            elif kind == "answer":
-                winsound.Beep(660, 120)
-            elif kind == "applause":
-                for f in [523, 659, 784, 1047]:
-                    winsound.Beep(f, 80)
-            elif kind == "finish":
-                for f in [523, 659, 784, 1047, 1319]:
-                    winsound.Beep(f, 100)
-        except Exception:
+        if sys.platform == "win32":
+            try:
+                import winsound
+                if kind == "question":
+                    winsound.Beep(880, 80)
+                elif kind == "answer":
+                    winsound.Beep(660, 120)
+                elif kind == "applause":
+                    for f in [523, 659, 784, 1047]:
+                        winsound.Beep(f, 80)
+                elif kind == "finish":
+                    for f in [523, 659, 784, 1047, 1319]:
+                        winsound.Beep(f, 100)
+            except Exception:
+                pass
+        else:
+            # Fallback for non-windows
             pass
     threading.Thread(target=_do, daemon=True).start()
 
@@ -595,7 +761,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("Blitzlesen – Lehrer-Steuerung")
         self.setMinimumSize(700, 580)
         self.resize(760, 640)
-        self.setStyleSheet("QMainWindow { background: #F5F5F5; }")
+        self.dark_mode = False
+        self.setStyleSheet(get_app_stylesheet(False))
         self.words     = []
         self.sentences = []
         self.slide_win = None
@@ -801,6 +968,12 @@ class MainWindow(QMainWindow):
             self.combo_bg.addItem(name)
         self.combo_bg.setFixedWidth(140)
         grid.addWidget(self.combo_bg, 3, 1)
+
+        self.chk_dark = QCheckBox("🌙 Dunkelmodus")
+        self.chk_dark.setFont(QFont("Segoe UI", 10))
+        self.chk_dark.stateChanged.connect(self._toggle_dark_mode)
+        grid.addWidget(self.chk_dark, 3, 2, 1, 2)
+
         root.addWidget(settings_group)
 
         # Silbenfarben
@@ -970,7 +1143,13 @@ class MainWindow(QMainWindow):
         self.chk_math_sound = _CB("🔔  Soundeffekte")
         self.chk_math_sound.setFont(QFont("Segoe UI", 10))
         self.chk_math_sound.setChecked(True)
-        ms_grid.addWidget(self.chk_math_sound, 3, 2, 1, 2)
+        ms_grid.addWidget(self.chk_math_sound, 3, 2)
+
+        self.chk_math_dark = QCheckBox("🌙 Dunkelmodus")
+        self.chk_math_dark.setFont(QFont("Segoe UI", 10))
+        self.chk_math_dark.stateChanged.connect(self._toggle_dark_mode)
+        ms_grid.addWidget(self.chk_math_dark, 3, 3)
+
         mroot.addWidget(ms_group)
 
         mul_group = QGroupBox("4.  Reihen für Einmaleins & Division")
@@ -1211,6 +1390,17 @@ class MainWindow(QMainWindow):
         self.btn_preview_syls.setEnabled(has)
         self.btn_preview_syls.setStyleSheet(self._btn_style("#F57C00", disabled=not has))
 
+    def _toggle_dark_mode(self, state):
+        self.dark_mode = (state == Qt.Checked)
+        self.setStyleSheet(get_app_stylesheet(self.dark_mode))
+        # Sync checkboxes
+        self.chk_dark.blockSignals(True)
+        self.chk_math_dark.blockSignals(True)
+        self.chk_dark.setChecked(state)
+        self.chk_math_dark.setChecked(state)
+        self.chk_dark.blockSignals(False)
+        self.chk_math_dark.blockSignals(False)
+
     def _pick_color(self, idx: int):
         current = QColor(self.syllable_colors[idx])
         color = QColorDialog.getColor(current, self, f"Farbe für Silbe {idx + 1}")
@@ -1408,35 +1598,60 @@ class MainWindow(QMainWindow):
         fs = self.spin_font.value()
         bg = BG_PRESETS[self.combo_bg.currentText()]
         slides = build_slides(self.words, self.sentences, wpr, spr, total)
-        js_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "make_blitzlesen_pptx.js")
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False, encoding='utf-8') as f:
-            json.dump({
-                "slides": slides,
-                "output_path": path,
-                "font_size": fs,
-                "bg_color": bg,
-                "colors": list(self.syllable_colors),
-                "overrides": dict(getattr(self, "_syllable_overrides", {})),
-            }, f, ensure_ascii=False)
-            tmp_json = f.name
         try:
-            result = subprocess.run(["node", js_script, tmp_json], capture_output=True, text=True, timeout=30)
-            if result.returncode == 0 and os.path.exists(path):
-                QMessageBox.information(self, "Fertig! ✓", f"PowerPoint wurde gespeichert:\n{path}")
-            else:
-                err = result.stderr or result.stdout or "Unbekannter Fehler"
-                QMessageBox.critical(self, "Fehler beim Export", f"PowerPoint konnte nicht erstellt werden:\n{err}")
-        except FileNotFoundError:
-            QMessageBox.critical(self, "Node.js nicht gefunden", "Node.js ist nicht installiert.\nBitte installiere Node.js von https://nodejs.org")
-        except subprocess.TimeoutExpired:
-            QMessageBox.critical(self, "Timeout", "Der Export hat zu lange gedauert.")
-        finally:
-            try:
-                os.unlink(tmp_json)
-            except Exception:
-                pass
+            save_to_pptx(
+                slides_data=slides,
+                output_path=path,
+                font_size=fs,
+                bg_color=bg,
+                syllable_colors=list(self.syllable_colors),
+                overrides=dict(getattr(self, "_syllable_overrides", {})),
+            )
+            QMessageBox.information(self, "Fertig! ✓", f"PowerPoint wurde gespeichert:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler beim Export", f"PowerPoint konnte nicht erstellt werden:\n{e}")
 
-    def _start_math(self):
+    def _export_math_pptx(self):
+        tasks = self._generate_math_tasks()
+        if not tasks:
+            return
+
+        path, _ = QFileDialog.getSaveFileName(self, "PowerPoint speichern", "Mathe_Blitz.pptx", "PowerPoint-Dateien (*.pptx)")
+        if not path:
+            return
+        if not path.endswith(".pptx"):
+            path += ".pptx"
+
+        fs = self.spin_math_font.value()
+        bg = BG_PRESETS[self.combo_math_bg.currentText()]
+
+        slides = []
+        for i, task in enumerate(tasks):
+            slides.append({"type": "math_q", "content": f"{task[0]}  =  ?"})
+            slides.append({"type": "math_a", "content": f"{task[0]}  =  {self._get_math_ans(task)}"})
+            if (i+1) % 5 == 0:
+                slides.append({"type": "dance"})
+
+        try:
+            save_to_pptx(
+                slides_data=slides,
+                output_path=path,
+                font_size=fs,
+                bg_color=bg,
+                syllable_colors=list(self.syllable_colors),
+                overrides={},
+            )
+            QMessageBox.information(self, "Fertig! ✓", f"PowerPoint wurde gespeichert:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Fehler beim Export", f"PowerPoint konnte nicht erstellt werden:\n{e}")
+
+    def _get_math_ans(self, task: tuple) -> str:
+        q, result, typ, a, op, b = task
+        if typ == "gap_left": return str(a)
+        if typ == "gap_right": return str(b)
+        return str(result)
+
+    def _generate_math_tasks(self):
         ops = []
         if self.chk_add.isChecked(): ops.append("add")
         if self.chk_sub.isChecked(): ops.append("sub")
@@ -1444,12 +1659,12 @@ class MainWindow(QMainWindow):
         if self.chk_div.isChecked(): ops.append("div")
         if not ops:
             QMessageBox.warning(self, "Hinweis", "Bitte mindestens eine Rechenart auswählen.")
-            return
+            return []
 
         mul_rows = [i+1 for i, c in enumerate(self.mul_checks) if c.isChecked()]
         if ("mul" in ops or "div" in ops) and not mul_rows:
             QMessageBox.warning(self, "Hinweis", "Bitte mindestens eine Reihe auswählen.")
-            return
+            return []
 
         import random as _r
         tasks = []
@@ -1521,6 +1736,12 @@ class MainWindow(QMainWindow):
                             tasks.append((f"{dividend}  ÷  ?", result, "gap_right", dividend, "÷", divisor))
                     else:
                         tasks.append((f"{dividend}  ÷  {divisor}", result, "normal", dividend, "÷", divisor))
+        return tasks
+
+    def _start_math(self):
+        tasks = self._generate_math_tasks()
+        if not tasks:
+            return
 
         settings = {
             "font_size":      self.spin_math_font.value(),
